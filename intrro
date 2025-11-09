@@ -44,3 +44,15 @@ cp .env.example .env  # edit your keys/urls
 uvicorn fastapi_app:app --reload --port 8000
 
 
+
+frontend/
+  index.html
+  package.json
+  vite.config.js
+  src/
+    main.jsx
+    App.jsx
+    api.js
+
+
+
