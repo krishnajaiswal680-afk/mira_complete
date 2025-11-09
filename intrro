@@ -56,3 +56,33 @@ frontend/
 
 
 
+
+
+cd frontend
+npm i
+npm run dev
+# open http://localhost:5173
+
+
+
+
+
+MCP_PORT=9000 python server.py
+
+
+
+
+cd backend
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env  # अपनी keys भरें
+uvicorn fastapi_app:app --reload --port 8000
+
+
+
+cd frontend
+npm i
+npm run dev
+
+
+
