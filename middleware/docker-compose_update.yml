@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7.2
+    container_name: flightops-redis
+    ports:
+      - "6379:6379"
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
+
+  mongodb:
+    image: mongo:6.0
+    container_name: flightops-mongo
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: root
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: flightops-mcp
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      - mongodb
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+
+  adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile.adapter
+    container_name: flightops-adapter
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      - mcp
+      - redis
+    ports:
+      - "8001:8001"
+    volumes:
+      - .:/app
+
+volumes:
+  mongo_data:
