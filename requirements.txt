@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+motor
+mcp
+openai
+ag-ui-protocol
