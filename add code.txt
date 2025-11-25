@@ -1,3 +1,8 @@
+https://chat.deepseek.com/share/oqbp7g2rnvmp3dcksd
+
+
+
+
 # add at the end in server.py
 
 @mcp.tool()
@@ -163,3 +168,5 @@ Rules:
 7. If carrier or date not mentioned, omit them instead of writing 'unknown'.
 8. Only use "tool" as key, not "name".
 """
+
+
