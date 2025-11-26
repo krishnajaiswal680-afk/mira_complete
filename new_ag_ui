@@ -11,10 +11,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from client import FlightOpsMCPClient
-
-from redis import Redis
-from redis_entraid.cred_provider import create_from_service_principal
+from client import FlightOpsMCPClient, extract_flight_details_from_query
 import logging
 
 app = FastAPI(title="FlightOps — AG-UI Adapter")
@@ -30,183 +27,14 @@ app.add_middleware(
 
 mcp_client = FlightOpsMCPClient()
 
-# ------------------------------------------------------------------------------------
-# REDIS CONFIGURATION
-# ------------------------------------------------------------------------------------
-REDIS_HOST = "occh-uamr01.centralindia.redis.azure.net"
-REDIS_PORT = 10000
-REDIS_CLIENT_ID = os.getenv("REDIS_CLIENT_ID")
-REDIS_CLIENT_SECRET = os.getenv("REDIS_CLIENT_SECRET")
-REDIS_TENANT_ID = os.getenv("REDIS_TENANT_ID")
-
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
-# Redis credential provider
-try:
-    redis_credential_provider = create_from_service_principal(
-        REDIS_CLIENT_ID,
-        REDIS_CLIENT_SECRET,
-        REDIS_TENANT_ID,
-    )
-except Exception as e:
-    logger.error("Failed to create redis credential provider: %s", e)
-    redis_credential_provider = None
-
-# DEV: create SSL flags that disable verification (ONLY FOR DEV)
-_dev_disable_ssl_verify = os.getenv("DISABLE_REDIS_SSL_VERIFY", "1") == "1"
-if _dev_disable_ssl_verify:
-    logger.warning("Redis SSL verification DISABLED (development)")
-
-redis_client = None
-
-try:
-    if redis_credential_provider:
-        redis_client = Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            ssl=True,
-            credential_provider=redis_credential_provider,
-            decode_responses=True,
-            socket_timeout=5,
-            socket_connect_timeout=5,
-            ssl_cert_reqs=None if _dev_disable_ssl_verify else "required",
-            ssl_check_hostname=False if _dev_disable_ssl_verify else True,
-        )
-        # quick non-fatal ping to surface connectivity issues early
-        try:
-            ok = redis_client.ping()
-            logger.info("Redis ping -> %s", ok)
-        except Exception as e:
-            logger.warning("Redis ping failed (will continue): %s", e)
-    else:
-        redis_client = None
-except TypeError as te:
-    logger.error("Redis client init TypeError (unsupported arg): %s", te)
-    redis_client = None
-except Exception as e:
-    logger.error("Failed to create redis_client: %s", e)
-    redis_client = None
-
-# Redis namespace configuration
-NAMESPACE = "non-prod"
-PROJECT = "occhub"
-MODULE = "flight_mcp"
-HISTORY_TTL_SECONDS = 60 * 60 * 24  # 1 day
-MAX_HISTORY_MESSAGES = 20  # last 20 messages (user+assistant)
-
-def make_history_key(session_id: str) -> str:
-    """Create Redis key for session history"""
-    return f"{NAMESPACE}:{PROJECT}:{MODULE}:history:{session_id}"
-
-def make_session_key(session_id: str) -> str:
-    """Create Redis key for session metadata"""
-    return f"{NAMESPACE}:{PROJECT}:{MODULE}:session:{session_id}"
-
-async def append_to_history(session_id: str, role: str, content: str, metadata: dict = None) -> None:
-    """Append a message to session history"""
-    if not redis_client:
-        logger.debug("append_to_history: redis_client is not available, skipping")
-        return
-
-    key = make_history_key(session_id)
-    try:
-        message_data = {
-            "role": role,
-            "content": content,
-            "timestamp": time.time(),
-            "metadata": metadata or {}
-        }
-
-        # Use pipeline for atomic operations
-        pipe = redis_client.pipeline()
-        pipe.rpush(key, json.dumps(message_data, ensure_ascii=False))
-        pipe.ltrim(key, -MAX_HISTORY_MESSAGES, -1)  # Keep only last N messages
-        pipe.expire(key, HISTORY_TTL_SECONDS)
-        pipe.execute()
-
-        logger.debug(f"💾 Saved message to history for session: {session_id}")
-    except Exception as e:
-        logger.warning("append_to_history failed for key=%s: %s", key, e)
-
-async def load_history(session_id: str, max_messages: int = MAX_HISTORY_MESSAGES) -> List[dict]:
-    """Load session history from Redis"""
-    if not redis_client:
-        logger.debug("load_history: redis_client is not available")
-        return []
-
-    key = make_history_key(session_id)
-    try:
-        length = redis_client.llen(key)
-    except Exception as e:
-        logger.warning("Redis llen failed for key=%s: %s", key, e)
-        return []
-
-    if not length:
-        return []
-
-    start = max(0, length - max_messages)
-    try:
-        raw_msgs = redis_client.lrange(key, start, -1)
-    except Exception as e:
-        logger.warning("Redis lrange failed for key=%s: %s", key, e)
-        return []
-
-    messages = []
-    for raw in raw_msgs:
-        try:
-            messages.append(json.loads(raw))
-        except Exception:
-            continue
-    return messages
-
-async def create_or_update_session(session_id: str, user_query: str = None) -> None:
-    """Create or update session metadata"""
-    if not redis_client:
-        return
-
-    try:
-        key = make_session_key(session_id)
-
-        # Generate title based on user query
-        title = f"Flight Query: {user_query[:50]}..." if user_query else f"Session {session_id[-8:]}"
-
-        session_data = {
-            "session_id": session_id,
-            "title": title,
-            "created_at": time.time(),
-            "last_activity": time.time(),
-            "message_count": 0,
-            "last_query": user_query or ""
-        }
-
-        # Update existing or create new
-        existing = redis_client.get(key)
-        if existing:
-            try:
-                existing_data = json.loads(existing)
-                session_data["created_at"] = existing_data.get("created_at", time.time())
-                session_data["message_count"] = existing_data.get("message_count", 0) + 1
-                # Update title if it's a new query
-                if user_query and len(user_query) > 10:
-                    session_data["title"] = title
-                else:
-                    session_data["title"] = existing_data.get("title", title)
-            except json.JSONDecodeError:
-                pass
-
-        redis_client.setex(key, HISTORY_TTL_SECONDS, json.dumps(session_data, ensure_ascii=False))
-        logger.debug(f"💾 Updated session metadata: {session_id}")
-    except Exception as e:
-        logger.warning(f"Failed to update session {session_id}: {e}")
-
-# ------------------------------------------------------------------------------------
-# Utility functions
-# ------------------------------------------------------------------------------------
+# Utility to format SSE data
 def sse_event(data: dict) -> str:
-    """Encode one SSE event (JSON payload)"""
-    return f"data: {json.dumps(data, default=str, ensure_ascii=False)}\n\n"
+    payload = json.dumps(data, default=str, ensure_ascii=False)
+    return f"data: {payload}\n\n"
 
 async def ensure_mcp_connected():
     if not mcp_client.session:
@@ -214,10 +42,11 @@ async def ensure_mcp_connected():
 
 @app.on_event("startup")
 async def startup_event():
+    # Try pre-connecting to MCP so first requests are faster
     try:
         await ensure_mcp_connected()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Could not preconnect to MCP: {e}")
 
 @app.get("/")
 async def root():
@@ -227,12 +56,7 @@ async def root():
 async def health():
     try:
         await ensure_mcp_connected()
-        redis_status = "connected" if redis_client and redis_client.ping() else "disconnected"
-        return {
-            "status": "healthy",
-            "mcp_connected": True,
-            "redis_connected": redis_status
-        }
+        return {"status": "healthy", "mcp_connected": True}
     except Exception as e:
         return {"status": "unhealthy", "mcp_connected": False, "error": str(e)}
 
@@ -256,9 +80,6 @@ def chunk_text(txt: str, max_len: int = 200) -> List[str]:
     flush()
     return parts
 
-# ------------------------------------------------------------------------------------
-# Tool selection logic for direct flight queries
-# ------------------------------------------------------------------------------------
 def determine_tool_from_query(query: str) -> str:
     """
     Determine which tool to use based on query content
@@ -280,123 +101,71 @@ def determine_tool_from_query(query: str) -> str:
     else:
         return "get_flight_basic_info"
 
-def extract_flight_details_from_query(query: str) -> dict:
-    """
-    Extract flight details from user query without LLM
-    """
-    details = {}
-    
-    # Extract carrier
-    carrier_match = re.search(r'\b(6E|AI|SG|UK|G8|IX|I5)\b', query.upper())
-    if carrier_match:
-        details["carrier"] = carrier_match.group(1)
-    
-    # Extract flight number
-    flight_match = re.search(r'flight\s+(\d+)', query.lower())
-    if flight_match:
-        details["flight_number"] = flight_match.group(1)
-    else:
-        # Direct number search
-        num_match = re.search(r'\b(\d{3,4})\b', query)
-        if num_match:
-            details["flight_number"] = num_match.group(1)
-    
-    # Extract date
-    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', query)
-    if date_match:
-        details["date_of_origin"] = date_match.group(1)
-    
-    return details
-
-# ------------------------------------------------------------------------------------
-# Direct flight query endpoints (NO LLM)
-# ------------------------------------------------------------------------------------
+# -------------------------
+# Direct-flight endpoints (no LLM)
+# -------------------------
 @app.post("/direct-flight-query")
 async def direct_flight_query(request: Request):
     """
-    Direct flight query without LLM planning
+    Direct flight query without LLM planning.
+    Body: { "query": "<user text>" }
+    Returns route-selection if multiple matching documents found, otherwise returns the single document result.
     """
     try:
         body = await request.json()
-        user_query = body.get("query", "")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-        # Extract flight details and determine tool
-        flight_details = extract_flight_details_from_query(user_query)
-        tool_name = determine_tool_from_query(user_query)
+    user_query = body.get("query", "") or ""
+    if not user_query.strip():
+        raise HTTPException(status_code=400, detail="No query provided")
 
+    # Extract flight details (carrier, flight_number, date_of_origin)
+    flight_details = extract_flight_details_from_query(user_query)
+    tool_name = determine_tool_from_query(user_query)
+
+    try:
         await ensure_mcp_connected()
-
-        # Direct handling
-        result = await mcp_client.handle_flight_query_direct(
-            user_query,
-            tool_name,
-            flight_details
-        )
-
-        return {
-            "success": True,
-            "data": result
-        }
-
     except Exception as e:
+        return {"success": False, "error": f"MCP connection failed: {e}"}
+
+    # Use client's direct handler that already implements multi-doc detection and returns structured result
+    try:
+        result = await mcp_client.handle_flight_query_direct(user_query, tool_name, flight_details)
+        return {"success": True, "data": result}
+    except Exception as e:
+        logger.exception("direct_flight_query failed")
         return {"success": False, "error": str(e)}
 
 @app.post("/select-route")
 async def select_route(request: Request):
     """
-    Handle user route selection
+    Handle user route selection after direct-flight-route list was shown.
+    Body: { "tool_name": "...", "tool_args": {...}, "selected_route": {"startStation": "...", "endStation": "..."} }
     """
     try:
         body = await request.json()
-        # expected: {"tool_name": "...", "tool_args": {...}, "selected_doc_id": "..."}
-        tool_name = body.get("tool_name")
-        tool_args = body.get("tool_args", {})
-        selected_doc_id = body.get("selected_doc_id", None)
-        user_query = body.get("user_query", "")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-        if not selected_doc_id:
-            return {"success": False, "error": "selected_doc_id required"}
+    tool_name = body.get("tool_name")
+    tool_args = body.get("tool_args", {})
+    selected_route = body.get("selected_route", {})
 
+    if not tool_name or not selected_route:
+        raise HTTPException(status_code=400, detail="tool_name and selected_route required")
+
+    try:
         await ensure_mcp_connected()
-
-        # fetch the full document by id using the new tool exposed on the server
-        # note: get_flight_by_id returns response_ok(...) JSON
-        fetch_resp = await mcp_client.invoke_tool("get_flight_by_id", {"doc_id": selected_doc_id})
-        if fetch_resp.get("ok") is False:
-            return {"success": False, "error": fetch_resp.get("error")}
-
-        doc = fetch_resp.get("data")
-        if not doc:
-            return {"success": False, "error": "Document not found after selection"}
-
-        # Now summarize results using the client's summarizer (LLM)
-        # We'll reuse the FlightOpsMCPClient.summarize_results (synchronous, but it's a wrapper that calls Azure)
-        # summarize_results expects: user_query, plan, results
-        # We'll build a simple "plan" indicating the original tool and a single step
-        plan = [{"tool": tool_name, "arguments": tool_args}]
-        results = [{tool_name: {"ok": True, "data": doc}}]
-
-        # run summarizer in threadpool since it's CPU/IO bound
-        loop = asyncio.get_event_loop()
-        summary_data = await loop.run_in_executor(None, mcp_client.summarize_results, user_query, plan, results)
-        assistant_text = summary_data.get("summary", "") if isinstance(summary_data, dict) else str(summary_data)
-
-        # Save assistant response to history (Redis)
-        session_id = tool_args.get("thread_id") or tool_args.get("session_id") or f"thread-{uuid.uuid4().hex[:8]}"
-        await append_to_history(session_id, "assistant", assistant_text, {
-            "selected_doc_id": selected_doc_id,
-            "tool": tool_name
-        })
-
-        return {"success": True, "summary": assistant_text, "document": doc}
+        result = await mcp_client.get_documents_by_route_selection(tool_name, tool_args, selected_route)
+        return {"success": True, "data": result}
     except Exception as e:
+        logger.exception("select_route failed")
         return {"success": False, "error": str(e)}
 
-# ------------------------------------------------------------------------------------
-# AG-UI /agent: route between direct flight flow & LLM flow + Redis integration
-# (keeps your existing /agent implementation — unchanged here for brevity)
-# ------------------------------------------------------------------------------------
-
+# -------------------------
+# AG-UI /agent endpoint (streaming)
+# -------------------------
 @app.post("/agent", response_class=StreamingResponse)
 async def run_agent(request: Request):
     try:
@@ -408,37 +177,51 @@ async def run_agent(request: Request):
     run_id = body.get("run_id") or f"run-{uuid.uuid4().hex[:8]}"
     messages = body.get("messages", [])
 
-    # Use thread_id as session_id for history tracking
-    session_id = thread_id
-
-    # last user message as query
+    # determine user query — prefer last user message
     user_query = ""
     if messages:
         last = messages[-1]
         if isinstance(last, dict) and last.get("role") == "user":
-            user_query = last.get("content", "") or ""
+            user_query = last.get("content", "")
         elif isinstance(last, str):
             user_query = last
 
-    if not user_query.strip():
-        raise HTTPException(status_code=400, detail="No user query found")
+    if not user_query or not user_query.strip():
+        raise HTTPException(status_code=400, detail="No user query in messages payload")
 
-    # Save user message to history and update session (Redis integration)
-    await append_to_history(session_id, "user", user_query, {"run_id": run_id})
-    await create_or_update_session(session_id, user_query)
-
-    # Check if this is a flight query that can use direct handling
+    # Determine if this is a flight query that can be handled directly
     is_flight_query = any(keyword in user_query.lower() for keyword in
-                          ['flight', '6e', 'carrier', 'delay', 'time', 'equipment', 'fuel', 'passenger', 'crew'])
+                         ['flight', '6e', 'carrier', 'delay', 'time', 'equipment', 'fuel', 'passenger', 'crew'])
 
     if is_flight_query:
-        # Use direct flight query handling (with Redis-aware SSE)
-        return await handle_direct_flight_query(user_query, thread_id, run_id, session_id)
+        # Use lightweight direct flow (no LLM planning) and stream back SSE events
+        return await handle_direct_flight_query(user_query, thread_id, run_id)
     else:
-        # Use LLM-based handling (with Redis-aware SSE)
-        return await handle_llm_based_query(user_query, thread_id, run_id, session_id, request)
+        # Use LLM-based handling
+        return await handle_llm_based_query(user_query, thread_id, run_id, request)
 
-# (the rest of the file — handle_direct_flight_query, handle_llm_based_query, format_flight_result,
-# session endpoints, get_chat_history, get_session_messages — keep as in your previous file)
-# For brevity I assume you keep the rest unchanged and working as before.
-# Ensure you keep the earlier functions from your previous version intact below this point.
+# ---- Direct flight SSE handler (no LLM) ----
+async def handle_direct_flight_query(user_query: str, thread_id: str, run_id: str):
+    async def event_stream() -> AsyncGenerator[str, None]:
+        # RUN_STARTED
+        yield sse_event({"type": "RUN_STARTED", "thread_id": thread_id, "run_id": run_id})
+
+        # THINKING
+        yield sse_event({
+            "type": "STATE_UPDATE",
+            "state": {"phase": "thinking", "progress_pct": 10, "message": "Analyzing flight query..."}
+        })
+
+        try:
+            await ensure_mcp_connected()
+        except Exception as e:
+            yield sse_event({"type": "RUN_ERROR", "error": f"MCP connect failed: {e}"})
+            return
+
+        # extract details and pick a tool
+        flight_details = extract_flight_details_from_query(user_query)
+        tool_name = determine_tool_from_query(user_query)
+
+        yield sse_event({
+            "type": "STATE_UPDATE",
+            "state": {"phase": "processing", "progre
